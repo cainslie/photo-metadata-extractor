@@ -17,12 +17,77 @@ import base64
 import requests
 import io
 import subprocess
+import time
 from pathlib import Path
 from PIL import Image
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen2.5vl:7b"
 DEFAULT_MAX_WIDTH = 512
+
+
+class ProgressTracker:
+    """Track progress and calculate ETA."""
+
+    def __init__(self, total: int):
+        self.total = total
+        self.processed = 0
+        self.skipped = 0
+        self.failed = 0
+        self.start_time = time.time()
+        self.last_report_time = self.start_time
+        self.last_report_count = 0
+
+    def update(self, success: bool, skipped: bool = False):
+        self.processed += 1
+        if skipped:
+            self.skipped += 1
+        elif not success:
+            self.failed += 1
+
+    def get_stats(self) -> dict:
+        elapsed = time.time() - self.start_time
+        rate = self.processed / elapsed if elapsed > 0 else 0
+        remaining = self.total - self.processed
+        eta_seconds = remaining / rate if rate > 0 else 0
+
+        return {
+            "processed": self.processed,
+            "total": self.total,
+            "percent": (self.processed / self.total * 100) if self.total > 0 else 0,
+            "skipped": self.skipped,
+            "failed": self.failed,
+            "elapsed_seconds": elapsed,
+            "rate_per_minute": rate * 60,
+            "eta_seconds": eta_seconds,
+        }
+
+    def format_time(self, seconds: float) -> str:
+        """Format seconds as human-readable time."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds/60:.0f}m"
+        else:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h {minutes}m"
+
+    def should_report(self, interval: int = 50) -> bool:
+        """Check if we should print a progress report."""
+        return self.processed % interval == 0 or self.processed == self.total
+
+    def print_progress(self):
+        """Print current progress with rate and ETA."""
+        stats = self.get_stats()
+        eta_str = self.format_time(stats["eta_seconds"])
+        elapsed_str = self.format_time(stats["elapsed_seconds"])
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"PROGRESS: {stats['processed']:,}/{stats['total']:,} ({stats['percent']:.1f}%)", flush=True)
+        print(f"  Rate: {stats['rate_per_minute']:.1f} img/min | Elapsed: {elapsed_str} | ETA: {eta_str}", flush=True)
+        print(f"  Skipped: {stats['skipped']:,} | Failed: {stats['failed']:,}", flush=True)
+        print(f"{'='*60}\n", flush=True)
 
 
 def run_exiftool(image_path: str) -> dict:
@@ -134,8 +199,7 @@ def process_image(image_path: Path, ollama_url: str, model: str, max_width: int,
     output_path = image_path.parent / f"{image_path.name}_metadata.json"
 
     if skip_existing and output_path.exists():
-        print(f"Skipping (exists): {image_path.name}", flush=True)
-        return True
+        return None  # Return None to indicate skipped
 
     print(f"Processing: {image_path.name}", flush=True)
 
@@ -203,24 +267,42 @@ def main():
         return 1
 
     images = find_images(args.directory)
-    print(f"Found {len(images)} images to process\n", flush=True)
+    total = len(images)
+    print(f"Found {total:,} images to process\n", flush=True)
 
     if not images:
         print("No images found.")
         return 0
 
-    success = 0
-    failed = 0
+    tracker = ProgressTracker(total)
 
     for i, img in enumerate(sorted(images), 1):
-        print(f"\n[{i}/{len(images)}] ", end="", flush=True)
-        if process_image(img, args.ollama_url, args.model, args.max_width, not args.overwrite):
-            success += 1
-        else:
-            failed += 1
+        print(f"[{i}/{total}] ", end="", flush=True)
+        result = process_image(img, args.ollama_url, args.model, args.max_width, not args.overwrite)
 
-    print(f"\n\nDone! Success: {success}, Failed: {failed}")
-    return 0 if failed == 0 else 1
+        if result is None:
+            # Skipped
+            print(f"Skipping (exists): {img.name}", flush=True)
+            tracker.update(success=True, skipped=True)
+        elif result:
+            tracker.update(success=True)
+        else:
+            tracker.update(success=False)
+
+        # Print progress every 50 images
+        if tracker.should_report(50):
+            tracker.print_progress()
+
+    # Final summary
+    stats = tracker.get_stats()
+    print(f"\n{'='*60}", flush=True)
+    print(f"COMPLETE!", flush=True)
+    print(f"  Processed: {stats['processed']:,} images in {tracker.format_time(stats['elapsed_seconds'])}", flush=True)
+    print(f"  Success: {stats['processed'] - stats['failed'] - stats['skipped']:,} | Skipped: {stats['skipped']:,} | Failed: {stats['failed']:,}", flush=True)
+    print(f"  Average rate: {stats['rate_per_minute']:.1f} img/min", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    return 0 if stats['failed'] == 0 else 1
 
 
 if __name__ == "__main__":
